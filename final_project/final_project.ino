@@ -13,6 +13,7 @@
 #include <TimeLib.h>
 #include <WidgetRTC.h>
 #include "HX711.h"
+#include <TinyStepper_28BYJ_48.h>
 
 #define MOTOR_SPEED 175
 #define EspSerial Serial1
@@ -26,6 +27,10 @@
 #define BEAM 27 // Beam break sensor
 #define LOAD_CELL_DATA 3 // Load cell data
 #define LOAD_CELL_CLK 2 // Load cell clock
+#define AGITATOR_A  8 // Agitator Coil A
+#define AGITATOR_B  9 // Agitator Coil B
+#define AGITATOR_C  10 // Agitator Coil C
+#define AGITATOR_D  11 // Agitator Coil D
 
 #define CALIBRATION_FACTOR -1952 // Calibration value
 
@@ -42,11 +47,13 @@ int days2[7];
 // Bowl Weight
 float currWeight = 0.0; // in grams
 float minWeight = 0.0;
-float pastWeight = 0.0;
-float deltaWeight = 0.0;
 
 // Default feed duration
 int duration = 1;
+
+// Agitator settings
+int steps = 0;
+const int STEPS_PER_REVOLUTION = 2048;
 
 // Current time variables
 int currHour, currMin, currDay;
@@ -68,6 +75,8 @@ char pass[] = "";
 BlynkTimer timer;
 
 WidgetRTC rtc;
+
+TinyStepper_28BYJ_48 stepper;
 
 BLYNK_CONNECTED() {
   // sync clock on connection
@@ -97,6 +106,9 @@ void setup()
   pinMode(STEPPER_EN, OUTPUT);
 
   digitalWrite(STEPPER_EN, HIGH); //Disables the motor, so it can rest until it is called upon
+
+  // connect and configure the stepper motor to its IO pins
+  stepper.connectToPins(AGITATOR_A, AGITATOR_B, AGITATOR_C, AGITATOR_D);
 
   // setup data line on BEAM
   pinMode(BEAM, INPUT);
@@ -140,9 +152,30 @@ void updateTime() {
   currMin = minute();
   currDay = weekday();
   Serial.println(String("Time updated: Day ") + currDay + String(" ") + currHour + String(":") + ((currMin < 10) ? String("0") + currMin : currMin));
+  float t = currHour + (double) currMin/100;
+  Serial.println(String("Time sent to app: ") + t);
+  Blynk.virtualWrite(V14, t); //send current time to app
+  Blynk.virtualWrite(V15, 0); //Tell app motor is not rotating
 
-  if(checkSchedule(1) || checkSchedule(2)) {
-    rotate(duration);
+  if(checkSchedule(1)) {
+    // if schedule has been reached and min weight selected
+    if(minWeight != 0) {
+      maintainWeight();
+    } // otherwise, dispense default amount
+    else {
+      Serial.println(String("Scheduled Feeding 1: ") + startHour1 + String(":") + ((startMin1 < 10) ? String("0") + startMin1 : startMin1));
+      rotate(duration);
+    }
+  }
+  else if(checkSchedule(2)) {
+    // if schedule has been reached and min weight selected
+    if(minWeight != 0) {
+      maintainWeight();
+    } // otherwise, dispense default amount
+    else {
+      Serial.println(String("Scheduled Feeding 2: ") + startHour2 + String(":") + ((startMin1 < 10) ? String("0") + startMin2 : startMin2));
+      rotate(duration);
+    }
   }
 }
 
@@ -161,9 +194,9 @@ void updateWeight() {
 }
 
 void plotFood() {
-  Blynk.virtualWrite(V12, deltaWeight);
-  Serial.println("Data sent to food dispensed chart");
-  deltaWeight = 0.0;
+  Blynk.virtualWrite(V12, currWeight);
+  Serial.println(String("Data sent to food chart: ") + currWeight);
+//  deltaWeight = 0.0;
 }
 
 void checkHopper() {
@@ -177,9 +210,9 @@ void checkHopper() {
 }
 
 void rotate(int cycles) {
-  pastWeight = currWeight;
   digitalWrite(STEPPER_EN, LOW); //Enabling the motor, so it will move when asked to
   digitalWrite(STEPPER_DIR, HIGH); //Setting the forward direction
+  Blynk.virtualWrite(V15, 1); //Tell app the motor is rotating
 
   for(int i = 0; i < cycles; i++) {
     //Cycle through forward direction
@@ -200,10 +233,21 @@ void rotate(int cycles) {
       digitalWrite(STEPPER_STEP, LOW);
       delayMicroseconds(MOTOR_SPEED*4);
     }
+
+    //change direction
+    digitalWrite(STEPPER_DIR, HIGH);
   }
   digitalWrite(STEPPER_EN, HIGH); //Disables the motor, so it can rest until the next time it is called upon
   updateWeight();
-  deltaWeight += currWeight - pastWeight;
+  agitator();
+}
+
+void agitator() {
+  Serial.println("Agitator activated");
+  stepper.setSpeedInStepsPerSecond(500);
+  stepper.setAccelerationInStepsPerSecondPerSecond(1000);
+  stepper.moveRelativeInSteps(STEPS_PER_REVOLUTION / 2);
+  delay(500);
 }
 
 BLYNK_WRITE(V6) // V6 is the Virtual Pin for Dispensing
