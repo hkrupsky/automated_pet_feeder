@@ -1,12 +1,8 @@
 /*************************************************************
-  ENGR 696/697 Final Project
+  SFSU ENGR 696/697 Final Project
   Automated Pet Feeder
-  
+  Howard Krupsky 2021
  *************************************************************/
-
-/* Comment this out to disable prints and save space */
-#define BLYNK_PRINT Serial
-
 #include <HID.h>
 #include <ESP8266_Lib.h>
 #include <BlynkSimpleShieldEsp8266.h>
@@ -14,29 +10,42 @@
 #include <WidgetRTC.h>
 #include "HX711.h"
 #include <TinyStepper_28BYJ_48.h>
+#include <movingAvg.h>
 
-#define MOTOR_SPEED 175
-#define EspSerial Serial1
-#define ESP8266_BAUD 115200 // ESP8266 baud rate
-#define FOOD_BOWL_WEIGHT 0 // weight of the empty bowl
+// Program Constants
+#define MOTOR_SPEED 175          // Auger stepper speed
+#define EspSerial Serial1        // ESP output
+#define ESP8266_BAUD 115200      // ESP8266 baud rate
+#define FOOD_BOWL_WEIGHT 0       // weight of the empty bowl
+#define BLYNK_PRINT Serial       // Print to console
 
 // Pin Assignments
-#define STEPPER_DIR 52 // Stepper direction
-#define STEPPER_STEP 50 // Stepper step
-#define STEPPER_EN 23 // Stepper enable
-#define BEAM 27 // Beam break sensor
-#define LOAD_CELL_DATA 3 // Load cell data
-#define LOAD_CELL_CLK 2 // Load cell clock
-#define AGITATOR_A  8 // Agitator Coil A
-#define AGITATOR_B  9 // Agitator Coil B
-#define AGITATOR_C  10 // Agitator Coil C
-#define AGITATOR_D  11 // Agitator Coil D
+#define STEPPER_DIR 52           // Stepper direction
+#define STEPPER_STEP 50          // Stepper step
+#define STEPPER_EN 23            // Stepper enable
+#define BEAM 27                  // Beam break sensor
+#define LOAD_CELL_DATA 3         // Load cell data
+#define LOAD_CELL_CLK 2          // Load cell clock
+#define AGITATOR_A  8            // Agitator Coil A
+#define AGITATOR_B  9            // Agitator Coil B
+#define AGITATOR_C  10           // Agitator Coil C
+#define AGITATOR_D  11           // Agitator Coil D
+#define CALIBRATION_FACTOR -1952 // Loadcell calibration value
 
-#define CALIBRATION_FACTOR -1952 // Calibration value
-
+// Defining various objects
 ESP8266 wifi(&EspSerial);
-
 HX711 scale;
+BlynkTimer timer;
+WidgetRTC rtc;
+TinyStepper_28BYJ_48 agitator;
+movingAvg avgDailyAmt(5); // average amount over 5 days
+
+// WiFi credentials.
+char ssid[] = "";
+char pass[] = "";
+
+// Blynk Authentication Token
+char auth[] = "";
 
 // Schedule variables
 int startHour1, startHour2;
@@ -58,28 +67,17 @@ const int STEPS_PER_REVOLUTION = 2048;
 // Current time variables
 int currHour, currMin, currDay;
 
-// Low Food Variable
+// Low food variables
 int sensorState = 0, lastState = 0;
 unsigned long previousMillis = 0;
 const long interval = 1000;
 
-// You should get Auth Token in the Blynk App.
-// Go to the Project Settings (nut icon).
-char auth[] = "";
+// Food Totals
+int dailyTotal;
+int tempWeight;
 
-// Your WiFi credentials.
-// Set password to "" for open networks.
-char ssid[] = "";
-char pass[] = "";
-
-BlynkTimer timer;
-
-WidgetRTC rtc;
-
-TinyStepper_28BYJ_48 stepper;
-
+// Sync clock on connection
 BLYNK_CONNECTED() {
-  // sync clock on connection
   rtc.begin();
 }
 
@@ -96,19 +94,18 @@ void setup()
 
   // Set intervals for the different timers
   timer.setInterval(60000L, updateTime);      // update time every 1 minute
-  timer.setInterval(300000L, plotFood);       // update chart tracking every 5 minutes
-  timer.setInterval(301000L, checkHopper);    // check hopper level every 5 minutes
+  timer.setInterval(300000L, plotFood);       // update chart every 5 minutes
   timer.setInterval(601000L, maintainWeight); // maintain set bowl weight every 10 minutes
   timer.setInterval(1800000L, updateWeight);  // update bowl weight every 30 minutes
+  timer.setInterval(3601000L, checkHopper);   // check hopper level every 60 minutes
 
   pinMode(STEPPER_DIR, OUTPUT);
   pinMode(STEPPER_STEP, OUTPUT);
   pinMode(STEPPER_EN, OUTPUT);
+  digitalWrite(STEPPER_EN, HIGH); // Disables the motor, so it can rest until it is called upon
 
-  digitalWrite(STEPPER_EN, HIGH); //Disables the motor, so it can rest until it is called upon
-
-  // connect and configure the stepper motor to its IO pins
-  stepper.connectToPins(AGITATOR_A, AGITATOR_B, AGITATOR_C, AGITATOR_D);
+  // connect and configure the agitator stepper to its IO pins
+  agitator.connectToPins(AGITATOR_A, AGITATOR_B, AGITATOR_C, AGITATOR_D);
 
   // setup data line on BEAM
   pinMode(BEAM, INPUT);
@@ -129,8 +126,14 @@ void setup()
   Blynk.virtualWrite(V10, minWeight);
   maintainWeight();
   updateTime();
+
+  // initialize total variables
+  avgDailyAmt.begin();
+  dailyTotal = 0.0f;
+  dailyAvg = 0;
 }
 
+// Check if scheduled feeding time has been reached and return true or false
 boolean checkSchedule(int schedule) {
   switch(schedule) {
     case 1:
@@ -146,17 +149,24 @@ boolean checkSchedule(int schedule) {
   }
 }
 
+// Update the time, provide daily food info, and check feeding schedule
 void updateTime() {
-  // function to update the time on the arduino
+  Blynk.virtualWrite(V15, 0); // Tell app the motor is not rotating
+  
+  // if new day, calculate rolling average and display daily amount on historic graph
+  if (currHour > hour()) {
+    Blynk.virtualWrite(V14, avgDailyAmt(dailyTotal));
+    Blynk.virtualWrite(V17, dailyTotal);
+    dailyTotal = 0;    // reset daily total
+  }
+
+  // update stored time and date
   currHour = hour();
   currMin = minute();
   currDay = weekday();
   Serial.println(String("Time updated: Day ") + currDay + String(" ") + currHour + String(":") + ((currMin < 10) ? String("0") + currMin : currMin));
-  float t = currHour + (double) currMin/100;
-  Serial.println(String("Time sent to app: ") + t);
-  Blynk.virtualWrite(V14, t); //send current time to app
-  Blynk.virtualWrite(V15, 0); //Tell app motor is not rotating
 
+  // checking if scheduled feeding time is reached
   if(checkSchedule(1)) {
     // if schedule has been reached and min weight selected
     if(minWeight != 0) {
@@ -179,6 +189,7 @@ void updateTime() {
   }
 }
 
+// Maintaining weight in bowl specified by user
 void maintainWeight() {
   if (currWeight < minWeight) {
     rotate(5);
@@ -186,6 +197,7 @@ void maintainWeight() {
   Serial.println("Bowl weight maintained");
 }
 
+// Update stored weight value
 void updateWeight() {
   // updates the bowl weight to the app
   currWeight = scale.get_units(10);
@@ -193,12 +205,13 @@ void updateWeight() {
   Serial.println(String("Current Bowl Weight: ") + currWeight);
 }
 
+// Plot current bowl weight on historic graph
 void plotFood() {
   Blynk.virtualWrite(V12, currWeight);
   Serial.println(String("Data sent to food chart: ") + currWeight);
-//  deltaWeight = 0.0;
 }
 
+// Alert user to low food event
 void checkHopper() {
   sensorState = digitalRead(BEAM);
   
@@ -209,10 +222,12 @@ void checkHopper() {
   lastState = sensorState;
 }
 
+// Rotate the auger stepper motor and dispense food
 void rotate(int cycles) {
   digitalWrite(STEPPER_EN, LOW); //Enabling the motor, so it will move when asked to
   digitalWrite(STEPPER_DIR, HIGH); //Setting the forward direction
   Blynk.virtualWrite(V15, 1); //Tell app the motor is rotating
+  tempWeight = static_cast<int>(currWeight);
 
   for(int i = 0; i < cycles; i++) {
     //Cycle through forward direction
@@ -239,19 +254,21 @@ void rotate(int cycles) {
   }
   digitalWrite(STEPPER_EN, HIGH); //Disables the motor, so it can rest until the next time it is called upon
   updateWeight();
+  dailyTotal += (static_cast<int>(currWeight) - tempWeight);
   agitator();
 }
 
+// Activate hopper agitator to prevent infeed jams
 void agitator() {
   Serial.println("Agitator activated");
-  stepper.setSpeedInStepsPerSecond(500);
-  stepper.setAccelerationInStepsPerSecondPerSecond(1000);
-  stepper.moveRelativeInSteps(STEPS_PER_REVOLUTION / 2);
+  agitator.setSpeedInStepsPerSecond(500);
+  agitator.setAccelerationInStepsPerSecondPerSecond(1000);
+  agitator.moveRelativeInSteps(STEPS_PER_REVOLUTION / 2);
   delay(500);
 }
 
-BLYNK_WRITE(V6) // V6 is the Virtual Pin for Dispensing
-{
+// V6 is the Virtual Pin for Dispensing
+BLYNK_WRITE(V6) {
   int pinValue = param.asInt();
   Serial.println(String("Dispensing: ") + pinValue);
   
@@ -260,16 +277,16 @@ BLYNK_WRITE(V6) // V6 is the Virtual Pin for Dispensing
   }
 }
 
-BLYNK_WRITE(V7) // V7 is the Virtual Pin for Feeding Duration
-{
+// V7 is the Virtual Pin for Feeding Duration
+BLYNK_WRITE(V7) {
   int pinValue = param.asInt();
   
   duration = pinValue;
   Serial.println(String("Feeding Duration: ") + duration);
 }
 
-BLYNK_WRITE(V8) // V8 is the Virtual Pin for Scheduling1
-{
+// V8 is the Virtual Pin for Scheduling1
+BLYNK_WRITE(V8) {
   TimeInputParam t(param);
 
   // Process start time
@@ -295,8 +312,8 @@ BLYNK_WRITE(V8) // V8 is the Virtual Pin for Scheduling1
   }
 }
 
-BLYNK_WRITE(V9) // V9 is the Virtual Pin for Scheduling2
-{
+// V9 is the Virtual Pin for Scheduling2
+BLYNK_WRITE(V9) {
   TimeInputParam t(param);
 
   // Process start time
@@ -322,8 +339,8 @@ BLYNK_WRITE(V9) // V9 is the Virtual Pin for Scheduling2
   }
 }
 
-BLYNK_WRITE(V10) // V10 is the virtual pin for selecting minimum bowl weight
-{
+// V10 is the virtual pin for selecting minimum bowl weight
+BLYNK_WRITE(V10) {
   double pinValue = param.asDouble();
   Serial.println(String("Min food weight: ") + pinValue);
 
@@ -331,14 +348,14 @@ BLYNK_WRITE(V10) // V10 is the virtual pin for selecting minimum bowl weight
   minWeight = pinValue;
 }
 
-BLYNK_READ(V11) // V11 gets the command from the app to check the current bowl weight
-{
+// V11 gets the command from the app to check the current bowl weight
+BLYNK_READ(V11) {
   updateWeight();
   Blynk.virtualWrite(V11, currWeight);
 }
 
-BLYNK_WRITE(V13) // V13 gets command to reset the scale to 0
-{
+// V13 gets command to reset the scale to 0
+BLYNK_WRITE(V13) {
   int pinValue = param.asInt();
   
   if (pinValue) {
@@ -350,6 +367,6 @@ BLYNK_WRITE(V13) // V13 gets command to reset the scale to 0
 
 void loop()
 {
-  Blynk.run();
+  Blynk.run(); // Initiates Blynk
   timer.run(); // Initiates BlynkTimer
 }
